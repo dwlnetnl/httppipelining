@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/textproto"
 	"net/url"
 )
 
@@ -66,7 +65,7 @@ func Supported(rw io.ReadWriter, host string) (bool, error) {
 // Prober probes a connection for HTTP pipelining support.
 type Prober interface {
 	// NumRequests return the number of requests used in probe.
-	NumRequests() int
+	NumRequests() uint
 
 	// WriteRequest writes a probe request.
 	WriteRequest(id uint, w *bufio.Writer) error
@@ -79,43 +78,39 @@ type Prober interface {
 
 // Probe probes connection rw for HTTP pipelining support.
 func Probe(rw io.ReadWriter, p Prober) (available bool, err error) {
-	type result struct {
+	type write struct {
 		id  uint
-		ok  bool
 		err error
 	}
 
-	var pl textproto.Pipeline
-	br := bufio.NewReader(rw)
-	bw := bufio.NewWriter(rw)
-
 	n := p.NumRequests()
-	results := make(chan result, n)
-	for i := 0; i < n; i++ {
-		go func() {
-			id := pl.Next()
-			pl.StartRequest(id)
+	writes := make(chan write, n)
+	flush := make(chan error)
+	go func() {
+		bw := bufio.NewWriter(rw)
+		for id := uint(0); id < n; id++ {
 			err := p.WriteRequest(id, bw)
-			pl.EndRequest(id)
-			if err != nil {
-				results <- result{id, false, err}
-				return
-			}
+			writes <- write{id, err}
+		}
+		flush <- bw.Flush()
+		close(writes)
+	}()
 
-			pl.StartResponse(id)
-			expected, err := p.ReadRequest(id, br)
-			pl.EndResponse(id)
-			results <- result{id, expected, err}
-		}()
+	if err := <-flush; err != nil {
+		return false, err
 	}
 
 	available = true
-	for i := 0; i < n; i++ {
-		r := <-results
-		if r.err != nil {
-			return false, r.err
+	br := bufio.NewReader(rw)
+	for w := range writes {
+		if w.err != nil {
+			return false, w.err
 		}
-		available = available && r.ok
+		expected, err := p.ReadRequest(w.id, br)
+		if err != nil {
+			return false, err
+		}
+		available = available && expected
 	}
 
 	return available, nil
@@ -127,19 +122,19 @@ type optionsProber struct {
 
 var _ Prober = (*optionsProber)(nil)
 
-func (p *optionsProber) NumRequests() int { return 2 }
+func (p *optionsProber) NumRequests() uint { return 2 }
 func (p *optionsProber) WriteRequest(id uint, w *bufio.Writer) (err error) {
 	switch id {
 	case 0:
 		// expect 200 OK
-		fmt.Fprintf(w, "OPTIONS * HTTP/1.1\r\nHost: %s\r\n\r\n", p.host)
+		_, err = fmt.Fprintf(w, "OPTIONS * HTTP/1.1\r\nHost: %s\r\n\r\n", p.host)
 	case 1:
 		// expect 400 Bad Request
-		fmt.Fprintf(w, "OPTIONS . HTTP/1.1\r\nHost: %s\r\n\r\n", p.host)
+		_, err = fmt.Fprintf(w, "OPTIONS . HTTP/1.1\r\nHost: %s\r\n\r\n", p.host)
 	default:
 		panic(fmt.Sprintf("invalid id: %d", id))
 	}
-	return w.Flush()
+	return err
 }
 
 func (p *optionsProber) ReadRequest(id uint, r *bufio.Reader) (expected bool, err error) {
